@@ -5,8 +5,158 @@ use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};
 use postgrest::Postgrest;
 use serde::{Serialize, Deserialize};
-use chrono::{DateTime};
+use chrono::DateTime;
 use dotenv;
+
+mod db {
+    use super::*;
+    use std::fmt;
+    
+    #[derive(Debug)]
+    pub enum DbError {
+        EnvError(std::env::VarError),
+        RequestError(Box<dyn std::error::Error + Send + Sync>),
+        SerializationError(serde_json::Error),
+    }
+    
+    impl fmt::Display for DbError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                DbError::EnvError(e) => write!(f, "Environment variable error: {}", e),
+                DbError::RequestError(e) => write!(f, "Database request error: {}", e),
+                DbError::SerializationError(e) => write!(f, "Serialization error: {}", e),
+            }
+        }
+    }
+    
+    impl std::error::Error for DbError {}
+    
+    impl From<std::env::VarError> for DbError {
+        fn from(error: std::env::VarError) -> Self {
+            DbError::EnvError(error)
+        }
+    }
+    
+    impl From<serde_json::Error> for DbError {
+        fn from(error: serde_json::Error) -> Self {
+            DbError::SerializationError(error)
+        }
+    }
+    
+    impl From<reqwest::Error> for DbError {
+        fn from(error: reqwest::Error) -> Self {
+            DbError::RequestError(Box::new(error))
+        }
+    }
+    
+    impl From<std::io::Error> for DbError {
+        fn from(error: std::io::Error) -> Self {
+            DbError::RequestError(Box::new(error))
+        }
+    }
+    
+    pub fn from_error<E>(error: E) -> DbError 
+    where 
+        E: std::error::Error + Send + Sync + 'static
+    {
+        DbError::RequestError(Box::new(error))
+    }
+
+    impl From<dotenv::Error> for DbError {
+        fn from(error: dotenv::Error) -> Self {
+            DbError::RequestError(Box::new(error))
+        }
+    }
+    
+    pub fn create_client() -> Result<Postgrest, DbError> {
+        let public_key = dotenv::var("SUPABASE_PUBLIC_API_KEY")?;
+        let service_key = dotenv::var("SUPABASE_SERVICE_KEY")?;
+        
+        Ok(Postgrest::new("https://qlwtplrrqsmdlxhxhphf.supabase.co/rest/v1")
+            .insert_header("apikey", public_key)
+            .insert_header("Authorization", format!("Bearer {}", service_key)))
+    }
+    
+    #[derive(Debug, Serialize, Deserialize)]
+    struct AuctionOrder {
+        auction_id: String,
+        user_id: String,
+        order_type: String,
+        quantity_mwh: u64,
+        price_per_mwh: u64,
+    }
+    
+    #[tokio::main]
+    pub async fn update_auction_status(auction_id: &str, status: &str) -> Result<(), DbError> {
+        println!("Updating auction status to '{}' in Supabase...", status);
+        
+        let client = create_client()?;
+        let update_data = serde_json::json!({ "status": status });
+        
+        let resp = match client
+            .from("auctions")
+            .eq("id", auction_id)
+            .update(update_data.to_string())
+            .execute()
+            .await {
+                Ok(resp) => resp,
+                Err(e) => return Err(from_error(e)),
+            };
+            
+        match resp.text().await {
+            Ok(text) => println!("Response from Supabase: {}", text),
+            Err(e) => eprintln!("Failed to get response text: {}", e),
+        }
+        Ok(())
+    }
+    
+    #[tokio::main]
+    async fn add_order(auction_id: &str, order: AuctionOrder) -> Result<(), DbError> {
+        println!("Writing new {} to Supabase...", order.order_type);
+        
+        let client = create_client()?;
+        let order_json = serde_json::to_string(&order)?;
+        
+        let resp = match client
+            .from("auction_orders")
+            .insert(order_json)
+            .execute()
+            .await {
+                Ok(resp) => resp,
+                Err(e) => return Err(from_error(e)),
+            };
+            
+            match resp.text().await {
+                Ok(text) => println!("Response from Supabase: {}", text),
+                Err(e) => eprintln!("Failed to get response text: {}", e),
+            }
+            Ok(())
+    }
+    
+    pub fn add_bid(auction_id: &str, bid: &EnergyBid) -> Result<(), DbError> {
+        let order = AuctionOrder {
+            auction_id: auction_id.to_string(),
+            user_id: bid.bidder.clone(),
+            order_type: "bid".to_string(),
+            quantity_mwh: bid.quantity_mwh,
+            price_per_mwh: bid.price_per_mwh,
+        };
+        
+        add_order(auction_id, order)
+    }
+    
+    pub fn add_offer(auction_id: &str, offer: &EnergyOffer) -> Result<(), DbError> {
+        let order = AuctionOrder {
+            auction_id: auction_id.to_string(),
+            user_id: offer.seller.clone(),
+            order_type: "offer".to_string(), // Fixed: was incorrectly "bid"
+            quantity_mwh: offer.quantity_mwh,
+            price_per_mwh: offer.price_per_mwh,
+        };
+        
+        add_order(auction_id, order)
+    }
+}
 
 // Type alias for the Pubkey to make it more readable
 type Pubkey = String;
@@ -79,7 +229,20 @@ impl AuctionServer {
     }
 
     pub fn start(&self) -> std::io::Result<()> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        // Load environment variables
+        if let Err(e) = dotenv::dotenv() {
+            eprintln!("Warning: Failed to load .env file: {}", e);
+        }
+        
+        self.wait_for_start_time()?;
+        self.initialize_auction()?;
+        self.run_auction_loop()
+    }
+    
+    fn wait_for_start_time(&self) -> std::io::Result<()> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .as_secs() as i64;
         
         if now < self.start_time {
             let sleep_duration = (self.start_time - now) as u64;
@@ -87,16 +250,22 @@ impl AuctionServer {
             thread::sleep(Duration::from_secs(sleep_duration));
         }
         
+        Ok(())
+    }
+    
+    fn initialize_auction(&self) -> std::io::Result<()> {
         println!("Auction {} started at {}", self.auction_id, format_timestamp(self.start_time));
         println!("Auction will end at {}", format_timestamp(self.end_time));
 
-        dotenv::dotenv().ok();
-
-        match update_db_auction_active( self.auction_id.clone()) {
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(()) => { println!("Supabase updated successfully"); }
-            Err(e) => { eprintln!("Supabase update failed with error: {}", e)}
-        };
+        if let Err(e) = db::update_auction_status(&self.auction_id, "active") {
+            eprintln!("Failed to update auction status: {}", e);
+            // Continue despite DB error
+        }
         
+        Ok(())
+    }
+    
+    fn run_auction_loop(&self) -> std::io::Result<()> {
         // Start the TCP server to accept bids and offers
         let listener = TcpListener::bind("127.0.0.1:7878")?;
         listener.set_nonblocking(true)?;
@@ -104,55 +273,81 @@ impl AuctionServer {
         let orders_clone = Arc::clone(&self.orders);
 
         loop {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-            
-            // Periodically check if the auction has ended
-            if now >= self.end_time {
-                println!("Auction {} ended at {}", self.auction_id, format_timestamp(now));
-                self.finalize_auction();
+            if self.check_auction_end()? {
                 break;
             }
             
-            // Attempt to accept connections
-            match listener.accept() {
-                Ok((stream, addr)) => {
-                    println!("New connection: {}", addr);
-                    let orders_thread = Arc::clone(&orders_clone);
-                    let orders_post_thread = Arc::clone(&orders_clone);
-                    let auction_id = self.auction_id.clone();
-                    thread::spawn(move || {
-                        match handle_connection(stream, orders_thread) {
-                            "bid" => {
-                                let new_bid = orders_post_thread.lock().unwrap().bids.last().unwrap().clone();
-                                match add_bid_to_db(auction_id, new_bid) {
-                                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(()) => { println!("Supabase updated successfully"); }
-                                    Err(e) => { eprintln!("Supabase update failed with error: {}", e)}
-                                };
-                            }
-                            "offer" => {
-                                let new_offer = orders_post_thread.lock().unwrap().offers.last().unwrap().clone();
-                                match add_offer_to_db(auction_id, new_offer) {
-                                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(()) => { println!("Supabase updated successfully"); }
-                                    Err(e) => { eprintln!("Supabase update failed with error: {}", e)}
-                                };
-                            }
-                            _ => { eprintln!("Unexpected match result, no Supabase update performed on auction_bids table") }
-                        };
-                    });
-                    
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No connection available, continue
-                    thread::sleep(Duration::from_millis(100));
-                }
-                Err(e) => {
-                    eprintln!("Error accepting connection: {}", e);
-                    break;
-                }
-            }
+            self.process_connections(&listener, &orders_clone)?;
             
             // Sleep to avoid busy waiting
             thread::sleep(Duration::from_secs(1));
+        }
+        
+        Ok(())
+    }
+    
+    fn check_auction_end(&self) -> std::io::Result<bool> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .as_secs() as i64;
+            
+        if now >= self.end_time {
+            println!("Auction {} ended at {}", self.auction_id, format_timestamp(now));
+            self.finalize_auction();
+            return Ok(true);
+        }
+        
+        Ok(false)
+    }
+    
+    fn process_connections(&self, listener: &TcpListener, orders_clone: &Arc<Mutex<MatchOrders>>) -> std::io::Result<()> {
+        // Attempt to accept connections
+        match listener.accept() {
+            Ok((stream, addr)) => {
+                println!("New connection: {}", addr);
+                let orders_thread = Arc::clone(orders_clone);
+                let auction_id = self.auction_id.clone();
+                
+                thread::spawn(move || {
+                    match handle_connection(stream, Arc::clone(&orders_thread)) {
+                        "bid" => {
+                            let bid = {
+                                let orders = orders_thread.lock().unwrap();
+                                orders.bids.last().unwrap().clone()
+                            };
+                            
+                            if let Err(e) = db::add_bid(&auction_id, &bid) {
+                                eprintln!("Failed to add bid to database: {}", e);
+                            } else {
+                                println!("Bid added to database successfully");
+                            }
+                        }
+                        "offer" => {
+                            let offer = {
+                                let orders = orders_thread.lock().unwrap();
+                                orders.offers.last().unwrap().clone()
+                            };
+                            
+                            if let Err(e) = db::add_offer(&auction_id, &offer) {
+                                eprintln!("Failed to add offer to database: {}", e);
+                            } else {
+                                println!("Offer added to database successfully");
+                            }
+                        }
+                        _ => {
+                            eprintln!("Unexpected result from connection handler");
+                        }
+                    };
+                });
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No connection available, continue
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                eprintln!("Error accepting connection: {}", e);
+                return Err(e);
+            }
         }
         
         Ok(())
@@ -181,102 +376,12 @@ impl AuctionServer {
         // Match orders
         println!("\nMatching orders:");
         match_orders(&orders);
+        
+        // Update auction status to completed
+        if let Err(e) = db::update_auction_status(&self.auction_id, "completed") {
+            eprintln!("Failed to update auction status to completed: {}", e);
+        }
     }
-}
-
-fn create_supa_client() -> Postgrest {
-    // Create database client
-    Postgrest::new("https://qlwtplrrqsmdlxhxhphf.supabase.co/rest/v1")
-    .insert_header("apikey", dotenv::var("SUPABASE_PUBLIC_API_KEY").unwrap())
-    .insert_header("Authorization", format!("Bearer {}", dotenv::var("SUPABASE_SERVICE_KEY").unwrap()))
-}
-
-#[tokio::main]
-async fn update_db_auction_active(auction_id: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { 
-    let supa_resp = async {
-        println!("Writing updated status to Supabase...");
-
-        let supa_client = create_supa_client();
-        let resp = supa_client
-            .from("auctions")
-            .eq("id", auction_id)
-            .update("{\"status\": \"active\"}")
-            .execute()
-            .await?;
-        println!("Response from Supabase: {}", resp.text().await?);
-        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-    };
-    
-    // Now you can just await it directly
-    supa_resp.await?;
-    
-    Ok(())
-}
-
-#[tokio::main]
-async fn add_bid_to_db(auction_id: String, bid: EnergyBid) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let supa_resp = async {
-        println!("Writing new bid to Supabase...");
-
-        let supa_client = create_supa_client();
-        let bidder = bid.bidder.clone();
-        let quantity_mwh = bid.quantity_mwh.clone();
-        let price_per_mwh = bid.price_per_mwh.clone();
-
-        let new_bid = format!("{{
-            \"auction_id\": \"{auction_id}\",
-            \"user_id\": \"{bidder}\",
-            \"order_type\": \"bid\",
-            \"quantity_mwh\": \"{quantity_mwh}\",
-            \"price_per_mwh\": \"{price_per_mwh}\"
-        }}");
-
-        let resp = supa_client
-            .from("auction_orders")
-            .insert(new_bid)
-            .execute()
-            .await?;
-        println!("Response from Supabase: {}", resp.text().await?);
-        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-    };
-    
-    // Now you can just await it directly
-    supa_resp.await?;
-    
-    Ok(())
-}
-
-#[tokio::main]
-async fn add_offer_to_db(auction_id: String, offer: EnergyOffer) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let supa_resp = async {
-        println!("Writing new bid to Supabase...");
-
-        let supa_client = create_supa_client();
-        let seller = offer.seller.clone();
-        let quantity_mwh = offer.quantity_mwh.clone();
-        let price_per_mwh = offer.price_per_mwh.clone();
-
-        let new_offer = format!("{{
-            \"auction_id\": \"{auction_id}\",
-            \"user_id\": \"{seller}\",
-            \"order_type\": \"bid\",
-            \"quantity_mwh\": \"{quantity_mwh}\",
-            \"price_per_mwh\": \"{price_per_mwh}\"
-        }}");
-
-        let resp = supa_client
-            .from("auction_orders")
-            .insert(new_offer)
-            .execute()
-            .await?;
-        println!("Response from Supabase: {}", resp.text().await?);
-        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-    };
-    
-    // Now you can just await it directly
-    supa_resp.await?;
-    
-    Ok(())
 }
 
 fn handle_connection(mut stream: TcpStream, orders: Arc<Mutex<MatchOrders>>) -> &'static str {
@@ -293,7 +398,7 @@ fn handle_connection(mut stream: TcpStream, orders: Arc<Mutex<MatchOrders>>) -> 
             match serde_json::from_str::<Message>(&received_data) {
                 Ok(Message::Bid(bid)) => {
                     println!("Received bid: {:?}", bid);
-                    let mut orders: std::sync::MutexGuard<'_, MatchOrders> = orders.lock().unwrap();
+                    let mut orders = orders.lock().unwrap();
                     orders.add_bid(bid);
                     let response = serde_json::to_string(&Message::MatchResult).unwrap();
                     stream.write_all(response.as_bytes()).unwrap();
@@ -301,7 +406,7 @@ fn handle_connection(mut stream: TcpStream, orders: Arc<Mutex<MatchOrders>>) -> 
                 }
                 Ok(Message::Offer(offer)) => {
                     println!("Received offer: {:?}", offer);
-                    let mut orders: std::sync::MutexGuard<'_, MatchOrders> = orders.lock().unwrap();
+                    let mut orders = orders.lock().unwrap();
                     orders.add_offer(offer);
                     let response = serde_json::to_string(&Message::MatchResult).unwrap();
                     stream.write_all(response.as_bytes()).unwrap();
