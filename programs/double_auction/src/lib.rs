@@ -111,7 +111,7 @@ mod db {
     }
     
     #[tokio::main]
-    async fn add_order(auction_id: &str, order: AuctionOrder) -> Result<(), DbError> {
+    async fn add_order(order: AuctionOrder) -> Result<(), DbError> {
         println!("Writing new {} to Supabase...", order.order_type);
         
         let client = create_client()?;
@@ -142,7 +142,7 @@ mod db {
             price_per_mwh: bid.price_per_mwh,
         };
         
-        add_order(auction_id, order)
+        add_order(order)
     }
     
     pub fn add_offer(auction_id: &str, offer: &EnergyOffer) -> Result<(), DbError> {
@@ -154,7 +154,7 @@ mod db {
             price_per_mwh: offer.price_per_mwh,
         };
         
-        add_order(auction_id, order)
+        add_order(order)
     }
 }
 
