@@ -85,6 +85,15 @@ mod db {
         quantity_mwh: u64,
         price_per_mwh: u64,
     }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct AuctionResult {
+        auction_id: String,
+        clearing_price: u64,
+        participant_count: u64,
+        cleared_money_volume: u64,
+        cleared_mwh_volume: u64
+    }
     
     #[tokio::main]
     pub async fn update_auction_status(auction_id: &str, status: &str) -> Result<(), DbError> {
@@ -96,6 +105,31 @@ mod db {
         let resp = match client
             .from("auctions")
             .eq("id", auction_id)
+            .update(update_data.to_string())
+            .execute()
+            .await {
+                Ok(resp) => resp,
+                Err(e) => return Err(from_error(e)),
+            };
+            
+        match resp.text().await {
+            Ok(text) => println!("Response from Supabase: {}", text),
+            Err(e) => eprintln!("Failed to get response text: {}", e),
+        }
+        Ok(())
+    }
+
+    #[tokio::main]
+    pub async fn update_order_status(auction_id: &str, user_ids: Vec<&str>, status: &str) -> Result<(), DbError> {
+        println!("Updating order status for users to '{}' in Supabase...", status);
+        
+        let client = create_client()?;
+        let update_data = serde_json::json!({ "status": status });
+        
+        let resp = match client
+            .from("auction_orders")
+            .eq("auction_id", auction_id)
+            .in_("user_id", user_ids)
             .update(update_data.to_string())
             .execute()
             .await {
@@ -149,12 +183,49 @@ mod db {
         let order = AuctionOrder {
             auction_id: auction_id.to_string(),
             user_id: offer.seller.clone(),
-            order_type: "offer".to_string(), // Fixed: was incorrectly "bid"
+            order_type: "offer".to_string(),
             quantity_mwh: offer.quantity_mwh,
             price_per_mwh: offer.price_per_mwh,
         };
         
         add_order(order)
+    }
+
+    #[tokio::main]
+    pub async fn add_auction_result(
+        auction_id: &str,
+        clearing_price: &u64,
+        participant_count: &u64,
+        cleared_money_volume: &u64,
+        cleared_mwh_volume: &u64
+    ) -> Result<(), DbError> {
+        println!("Adding result of auction '{}' in Supabase...", auction_id);
+
+        let result = AuctionResult {
+            auction_id: auction_id.to_string(),
+            clearing_price: clearing_price.clone(),
+            participant_count: participant_count.clone(),
+            cleared_money_volume: cleared_money_volume.clone(),
+            cleared_mwh_volume: cleared_mwh_volume.clone()
+        };
+        let result_json = serde_json::to_string(&result)?;
+
+        let client = create_client()?;
+        
+        let resp = match client
+            .from("auction_results")
+            .insert(result_json)
+            .execute()
+            .await {
+                Ok(resp) => resp,
+                Err(e) => return Err(from_error(e)),
+            };
+            
+        match resp.text().await {
+            Ok(text) => println!("Response from Supabase: {}", text),
+            Err(e) => eprintln!("Failed to get response text: {}", e),
+        }
+        Ok(())
     }
 }
 
@@ -358,28 +429,76 @@ impl AuctionServer {
         
         println!("Auction {} final state:", self.auction_id);
         println!("Bids: {}", orders.bids.len());
+        /*
         for (i, bid) in orders.bids.iter().enumerate() {
             println!(
                 "  Bid #{}: {} mwh at {} per mwh from {}",
                 i + 1, bid.quantity_mwh, bid.price_per_mwh, bid.bidder
             );
         }
-        
+        */
         println!("Offers: {}", orders.offers.len());
+        /*
         for (i, offer) in orders.offers.iter().enumerate() {
             println!(
                 "  Offer #{}: {} mwh at {} per mwh from {}",
                 i + 1, offer.quantity_mwh, offer.price_per_mwh, offer.seller
             );
         }
+        */
+        // Naive approach, probably want to de-dup bidder and seller IDs
+        let participant_count: u64 = (orders.bids.len() + orders.offers.len()).try_into().unwrap();
         
         // Match orders
         println!("\nMatching orders:");
-        match_orders(&orders);
+        let matches = match_orders(&orders);
+
+        let clearing_price = matches[0].2;
+
+        let cleared_money_volume: u64 = matches.iter()
+        .map(| x | x.0.quantity_mwh)
+        .reduce(| acc, e| acc + (clearing_price * e))
+        .unwrap()
+        + matches.iter()
+        .map(| x | x.1.quantity_mwh)
+        .reduce(| acc, e| acc + (clearing_price * e))
+        .unwrap();
+
+        let cleared_mwh_volume: u64 = matches.iter()
+        .map(| x | x.0.quantity_mwh)
+        .reduce(| acc, e| acc + e)
+        .unwrap()
+        + matches.iter()
+        .map(| x | x.1.quantity_mwh)
+        .reduce(| acc, e| acc + e)
+        .unwrap();
+
+        let mut cleared_ids: Vec<&str> = matches.iter()
+        .map(| x | x.0.bidder.as_str())
+        .collect();
+        let mut cleared_seller_ids: Vec<&str> = matches.iter()
+        .map(| x | x.1.seller.as_str())
+        .collect();
+        cleared_ids.append(&mut cleared_seller_ids);
         
         // Update auction status to completed
         if let Err(e) = db::update_auction_status(&self.auction_id, "completed") {
             eprintln!("Failed to update auction status to completed: {}", e);
+        }
+
+        // Update all bids and offers that cleared
+        if let Err(e) = db::update_order_status(&self.auction_id, cleared_ids, "cleared") {
+            eprintln!("Failed to update cleared participants: {}", e);
+        }
+        
+        // Update auction results table
+        if let Err(e) = db::add_auction_result(
+            &self.auction_id,
+            &clearing_price,
+            &participant_count,
+            &cleared_money_volume,
+            &cleared_mwh_volume) {
+            eprintln!("Failed to add auction result to table: {}", e);
         }
     }
 }
@@ -425,7 +544,7 @@ fn handle_connection(mut stream: TcpStream, orders: Arc<Mutex<MatchOrders>>) -> 
     }
 }
 
-fn match_orders(orders: &MatchOrders) {
+fn match_orders(orders: &MatchOrders) -> Vec<(EnergyBid, EnergyOffer, u64)> {
     let mut bids = orders.bids.clone();
     let mut offers = orders.offers.clone();
     
@@ -476,6 +595,8 @@ fn match_orders(orders: &MatchOrders) {
     println!("\nTotal matches: {}", matches.len());
     println!("Unmatched bids: {}", bids.len());
     println!("Unmatched offers: {}", offers.len());
+
+    matches
 }
 
 fn format_timestamp(timestamp: i64) -> String {
