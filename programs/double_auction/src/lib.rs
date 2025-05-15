@@ -1,3 +1,4 @@
+use std::cmp::min;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::thread;
@@ -33,14 +34,14 @@ pub struct EnergyOffer {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MatchOrders {
+pub struct Orders {
     pub bids: Vec<EnergyBid>,
     pub offers: Vec<EnergyOffer>,
 }
 
-impl MatchOrders {
+impl Orders {
     fn new() -> Self {
-        MatchOrders {
+        Orders {
             bids: Vec::new(),
             offers: Vec::new(),
         }
@@ -70,7 +71,7 @@ pub struct AuctionServer {
     auction_id: String,
     start_time: i64,
     end_time: i64,
-    orders: Arc<Mutex<MatchOrders>>,
+    orders: Arc<Mutex<Orders>>,
 }
 
 impl AuctionServer {
@@ -79,7 +80,7 @@ impl AuctionServer {
             auction_id,
             start_time,
             end_time,
-            orders: Arc::new(Mutex::new(MatchOrders::new())),
+            orders: Arc::new(Mutex::new(Orders::new())),
         }
     }
 
@@ -155,7 +156,7 @@ impl AuctionServer {
         Ok(false)
     }
     
-    fn process_connections(&self, listener: &TcpListener, orders_clone: &Arc<Mutex<MatchOrders>>) -> std::io::Result<()> {
+    fn process_connections(&self, listener: &TcpListener, orders_clone: &Arc<Mutex<Orders>>) -> std::io::Result<()> {
         // Attempt to accept connections
         match listener.accept() {
             Ok((stream, addr)) => {
@@ -210,84 +211,64 @@ impl AuctionServer {
     
     fn finalize_auction(&self) {
         let orders = self.orders.lock().unwrap();
+        let num_bidders = orders.bids.len();
+        let num_offers = orders.offers.len();
         
         println!("Auction {} final state:", self.auction_id);
-        println!("Bids: {}", orders.bids.len());
-        /*
-        for (i, bid) in orders.bids.iter().enumerate() {
-            println!(
-                "  Bid #{}: {} mwh at {} per mwh from {}",
-                i + 1, bid.quantity_mwh, bid.price_per_mwh, bid.bidder
-            );
+        println!("Bids: {}", num_bidders);
+        println!("Offers: {}", num_offers);
+        // Check if there was at least one buyer and one seller, else return
+        if num_bidders >= 1 && num_offers >= 1 {
+            // Naive approach, probably want to de-dup bidder and seller IDs
+            let participant_count: u64 = (num_bidders + num_offers).try_into().unwrap();
+            
+            // Clear orders
+            println!("\nClearing orders");
+            let (clearing_price, cleared_orders) = clear_orders(&orders);
+
+            let cleared_mwh_volume: u64 = cleared_orders.iter()
+            .map(| x | x.2)
+            .reduce(| acc, mwh| acc + mwh)
+            .unwrap();
+
+            let cleared_money_volume: u64 = cleared_mwh_volume * clearing_price;
+
+            let mut cleared_ids: Vec<&str> = cleared_orders.iter()
+            .map(| x | x.0.bidder.as_str())
+            .collect();
+            let mut cleared_seller_ids: Vec<&str> = cleared_orders.iter()
+            .map(| x | x.1.seller.as_str())
+            .collect();
+            cleared_ids.append(&mut cleared_seller_ids);
+
+            // Update all bids and offers that cleared
+            if let Err(e) = db::update_order_status(&self.auction_id, cleared_ids, "cleared") {
+                eprintln!("Failed to update cleared participants: {}", e);
+            }
+            
+            // Update auction results table
+            if let Err(e) = db::add_auction_result(
+                &self.auction_id,
+                &clearing_price,
+                &participant_count,
+                &cleared_money_volume,
+                &cleared_mwh_volume
+            ) {
+                eprintln!("Failed to add auction result to table: {}", e);
+            }
         }
-        */
-        println!("Offers: {}", orders.offers.len());
-        /*
-        for (i, offer) in orders.offers.iter().enumerate() {
-            println!(
-                "  Offer #{}: {} mwh at {} per mwh from {}",
-                i + 1, offer.quantity_mwh, offer.price_per_mwh, offer.seller
-            );
-        }
-        */
-        // Naive approach, probably want to de-dup bidder and seller IDs
-        let participant_count: u64 = (orders.bids.len() + orders.offers.len()).try_into().unwrap();
-        
-        // Match orders
-        println!("\nMatching orders:");
-        let matches = match_orders(&orders);
 
-        let clearing_price = matches[0].2;
+        // Update all non-cleared orders
 
-        let cleared_money_volume: u64 = matches.iter()
-        .map(| x | x.0.quantity_mwh)
-        .reduce(| acc, e| acc + (clearing_price * e))
-        .unwrap()
-        + matches.iter()
-        .map(| x | x.1.quantity_mwh)
-        .reduce(| acc, e| acc + (clearing_price * e))
-        .unwrap();
-
-        let cleared_mwh_volume: u64 = matches.iter()
-        .map(| x | x.0.quantity_mwh)
-        .reduce(| acc, e| acc + e)
-        .unwrap()
-        + matches.iter()
-        .map(| x | x.1.quantity_mwh)
-        .reduce(| acc, e| acc + e)
-        .unwrap();
-
-        let mut cleared_ids: Vec<&str> = matches.iter()
-        .map(| x | x.0.bidder.as_str())
-        .collect();
-        let mut cleared_seller_ids: Vec<&str> = matches.iter()
-        .map(| x | x.1.seller.as_str())
-        .collect();
-        cleared_ids.append(&mut cleared_seller_ids);
-        
         // Update auction status to completed
         if let Err(e) = db::update_auction_status(&self.auction_id, "completed") {
             eprintln!("Failed to update auction status to completed: {}", e);
         }
 
-        // Update all bids and offers that cleared
-        if let Err(e) = db::update_order_status(&self.auction_id, cleared_ids, "cleared") {
-            eprintln!("Failed to update cleared participants: {}", e);
-        }
-        
-        // Update auction results table
-        if let Err(e) = db::add_auction_result(
-            &self.auction_id,
-            &clearing_price,
-            &participant_count,
-            &cleared_money_volume,
-            &cleared_mwh_volume) {
-            eprintln!("Failed to add auction result to table: {}", e);
-        }
     }
 }
 
-fn handle_connection(mut stream: TcpStream, orders: Arc<Mutex<MatchOrders>>) -> &'static str {
+fn handle_connection(mut stream: TcpStream, orders: Arc<Mutex<Orders>>) -> &'static str {
     let mut buffer = [0; 1024];
     
     match stream.read(&mut buffer) {
@@ -328,59 +309,78 @@ fn handle_connection(mut stream: TcpStream, orders: Arc<Mutex<MatchOrders>>) -> 
     }
 }
 
-fn match_orders(orders: &MatchOrders) -> Vec<(EnergyBid, EnergyOffer, u64)> {
-    let mut bids = orders.bids.clone();
-    let mut offers = orders.offers.clone();
-    
-    let mut matches = Vec::new();
-    
-    // Match highest bids with lowest offers
-    while !bids.is_empty() && !offers.is_empty() {
-        let bid = &bids[0];
-        let offer = &offers[0];
-        
-        // Check if bid price is greater than or equal to offer price
-        if bid.price_per_mwh >= offer.price_per_mwh {
-            // Calculate minimum quantity between bid and offer
-            let match_quantity = std::cmp::min(bid.quantity_mwh, offer.quantity_mwh);
-            
-            println!(
-                "Matched: {} mwh at {}-{} per mwh between bidder {} and seller {}",
-                match_quantity, offer.price_per_mwh, bid.price_per_mwh, bid.bidder, offer.seller
-            );
-            
-            matches.push((bid.clone(), offer.clone(), match_quantity));
-            
-            // Update quantities
-            let mut bid_clone = bid.clone();
-            let mut offer_clone = offer.clone();
-            
-            bid_clone.quantity_mwh -= match_quantity;
-            offer_clone.quantity_mwh -= match_quantity;
-            
-            // Remove the first bid and offer
-            bids.remove(0);
-            offers.remove(0);
-            
-            // If there's remaining quantity, add back to the vector
-            if bid_clone.quantity_mwh > 0 {
-                bids.insert(0, bid_clone);
+fn clear_orders(orders: &Orders) -> (u64, Vec<(EnergyBid, EnergyOffer, u64)>) {
+    let bids = orders.bids.clone();
+    let offers = orders.offers.clone();
+    let mut cleared_bids: Vec<EnergyBid> = Vec::new();
+    let mut cleared_offers: Vec<EnergyOffer> = Vec::new();
+    let mut cleared_orders: Vec<(EnergyBid, EnergyOffer, u64)> = Vec::new();
+    let mut clearing_price: u64 = 0;
+
+    // Find clearing price, which is the intersection of the bids and offers
+    /*  Because bids are descending and offers ascending, this is found by identifying either:
+            1. The lowest bid that has a matching offer
+                (implies all other bids will pay less than or equal to this bid, and all offers will receive more than or equal to this bid)
+            2. The lowest bid that has a higher offer, taking the average of the two 
+    */
+    for i in 0..min(bids.len(), offers.len()) {
+        if bids[i].price_per_mwh < offers[i].price_per_mwh {
+            if i == 0 {
+                // Means there was only 1 bid or offer and it didn't clear
+                cleared_orders.push((bids[0].clone(), offers[0].clone(), bids[0].quantity_mwh));
+                return (clearing_price, cleared_orders)
             }
-            
-            if offer_clone.quantity_mwh > 0 {
-                offers.insert(0, offer_clone);
-            }
-        } else {
-            // Bid price is less than offer price, no more matches possible
+            clearing_price = (bids[i-1].price_per_mwh + offers[i-1].price_per_mwh) / 2;
             break;
+        }
+        // Update clearing price to latest bid offer
+        clearing_price = bids[i].price_per_mwh;
+        // Add current bid and offer to cleared
+        cleared_bids.push(bids[i].clone());
+        cleared_offers.push(offers[i].clone());
+    }
+    
+    // Match bids and offers based on power offered
+    while !cleared_bids.is_empty() && !cleared_offers.is_empty() {
+        let bid = &cleared_bids[0];
+        let offer = &cleared_offers[0];
+    
+        // Calculate minimum quantity between bid and offer
+        let match_quantity = std::cmp::min(bid.quantity_mwh, offer.quantity_mwh);
+        
+        println!(
+            "Matched: {} mwh at {} per mwh between bidder {} and seller {}",
+            match_quantity, clearing_price, bid.bidder, offer.seller
+        );
+        
+        cleared_orders.push((bid.clone(), offer.clone(), match_quantity));
+        
+        // Update quantities
+        let mut bid_clone = bid.clone();
+        let mut offer_clone = offer.clone();
+        
+        bid_clone.quantity_mwh -= match_quantity;
+        offer_clone.quantity_mwh -= match_quantity;
+        
+        // Remove the first bid and offer
+        cleared_bids.remove(0);
+        cleared_offers.remove(0);
+        
+        // If there's remaining quantity, add back to the vector
+        if bid_clone.quantity_mwh > 0 {
+            cleared_bids.insert(0, bid_clone);
+        }
+        
+        if offer_clone.quantity_mwh > 0 {
+            cleared_offers.insert(0, offer_clone);
         }
     }
     
-    println!("\nTotal matches: {}", matches.len());
-    println!("Unmatched bids: {}", bids.len());
-    println!("Unmatched offers: {}", offers.len());
+    println!("\nTotal matches: {}", cleared_orders.len());
+    println!("Unmatched bids: {}", cleared_bids.len());
+    println!("Unmatched offers: {}", cleared_offers.len());
 
-    matches
+    (clearing_price, cleared_orders)
 }
 
 fn format_timestamp(timestamp: i64) -> String {
