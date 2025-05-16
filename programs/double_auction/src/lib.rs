@@ -165,35 +165,7 @@ impl AuctionServer {
                 let auction_id = self.auction_id.clone();
                 
                 thread::spawn(move || {
-                    match handle_connection(stream, Arc::clone(&orders_thread)) {
-                        "bid" => {
-                            let bid = {
-                                let orders = orders_thread.lock().unwrap();
-                                orders.bids.last().unwrap().clone()
-                            };
-                            
-                            if let Err(e) = db::add_bid(&auction_id, &bid) {
-                                eprintln!("Failed to add bid to database: {}", e);
-                            } else {
-                                println!("Bid added to database successfully");
-                            }
-                        }
-                        "offer" => {
-                            let offer = {
-                                let orders = orders_thread.lock().unwrap();
-                                orders.offers.last().unwrap().clone()
-                            };
-                            
-                            if let Err(e) = db::add_offer(&auction_id, &offer) {
-                                eprintln!("Failed to add offer to database: {}", e);
-                            } else {
-                                println!("Offer added to database successfully");
-                            }
-                        }
-                        _ => {
-                            eprintln!("Unexpected result from connection handler");
-                        }
-                    };
+                    handle_connection(stream, Arc::clone(&orders_thread), &auction_id);
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -268,13 +240,13 @@ impl AuctionServer {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, orders: Arc<Mutex<Orders>>) -> &'static str {
+fn handle_connection(mut stream: TcpStream, orders: Arc<Mutex<Orders>>, auction_id: &str) {
     let mut buffer = [0; 1024];
     
     match stream.read(&mut buffer) {
         Ok(size) => {
             if size == 0 {
-                return "";
+                return;
             }
             
             let received_data = String::from_utf8_lossy(&buffer[0..size]);
@@ -283,28 +255,36 @@ fn handle_connection(mut stream: TcpStream, orders: Arc<Mutex<Orders>>) -> &'sta
                 Ok(Message::Bid(bid)) => {
                     println!("Received bid: {:?}", bid);
                     let mut orders = orders.lock().unwrap();
+                    let bid_clone = bid.clone();
                     orders.add_bid(bid);
+                    if let Err(e) = db::add_bid(&auction_id, &bid_clone) {
+                        eprintln!("Failed to add bid to database: {}", e);
+                    } else {
+                        println!("Bid added to database successfully");
+                    }
                     let response = serde_json::to_string(&Message::MatchResult).unwrap();
                     stream.write_all(response.as_bytes()).unwrap();
-                    return "bid";
                 }
                 Ok(Message::Offer(offer)) => {
                     println!("Received offer: {:?}", offer);
                     let mut orders = orders.lock().unwrap();
+                    let offer_clone = offer.clone();
                     orders.add_offer(offer);
+                    if let Err(e) = db::add_offer(&auction_id, &offer_clone) {
+                        eprintln!("Failed to add offer to database: {}", e);
+                    } else {
+                        println!("Offer added to database successfully");
+                    }
                     let response = serde_json::to_string(&Message::MatchResult).unwrap();
                     stream.write_all(response.as_bytes()).unwrap();
-                    return "offer";
                 }
                 _ => {
                     eprintln!("Invalid message received");
-                    return "err";
                 }
             }
         }
         Err(e) => {
             eprintln!("Error reading from connection: {}", e);
-            return "err"
         }
     }
 }

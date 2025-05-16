@@ -89,7 +89,7 @@ struct AuctionResult {
 
 #[tokio::main]
 pub async fn update_auction_status(auction_id: &str, status: &str) -> Result<(), DbError> {
-    println!("Updating auction status to '{}' in Supabase...", status);
+    println!("\nUpdating auction status to '{}' in Supabase...", status);
     
     let client = create_client()?;
     let update_data = serde_json::json!({ "status": status });
@@ -113,32 +113,36 @@ pub async fn update_auction_status(auction_id: &str, status: &str) -> Result<(),
 
 #[tokio::main]
 pub async fn update_order_status(auction_id: &str, user_ids: Vec<&str>, status: &str) -> Result<(), DbError> {
-    println!("Updating order status for users to '{}' in Supabase...", status);
+    println!("\nUpdating order status for users to '{}' in Supabase...", status);
     
     let client = create_client()?;
+    // TODO: Include updated_at here
     let update_data = serde_json::json!({ "status": status });
-    
-    let resp = match client
-        .from("auction_orders")
-        .eq("auction_id", auction_id)
-        .in_("user_id", user_ids)
-        .update(update_data.to_string())
-        .execute()
-        .await {
-            Ok(resp) => resp,
-            Err(e) => return Err(from_error(e)),
-        };
-        
-    match resp.text().await {
-        Ok(text) => println!("Response from Supabase: {}", text),
-        Err(e) => eprintln!("Failed to get response text: {}", e),
+
+    // TODO: See if there's a way to bulk update
+    for user_id in user_ids {
+        let resp = match client
+            .from("auction_orders")
+            .eq("auction_id", auction_id)
+            .eq("user_id", user_id)
+            .update(update_data.to_string())
+            .execute()
+            .await {
+                Ok(resp) => resp,
+                Err(e) => return Err(from_error(e)),
+            };
+            
+        match resp.text().await {
+            Ok(text) => println!("Response from Supabase: {}", text),
+            Err(e) => eprintln!("Failed to get response text: {}", e),
+        }
     }
     Ok(())
 }
 
 #[tokio::main]
 async fn add_order(order: AuctionOrder) -> Result<(), DbError> {
-    println!("Writing new {} to Supabase...", order.order_type);
+    println!("\nWriting new {} to Supabase...", order.order_type);
     
     let client = create_client()?;
     let order_json = serde_json::to_string(&order)?;
@@ -191,7 +195,7 @@ pub async fn add_auction_result(
     cleared_money_volume: &u64,
     cleared_mwh_volume: &u64
 ) -> Result<(), DbError> {
-    println!("Adding result of auction '{}' in Supabase...", auction_id);
+    println!("\nAdding result of auction '{}' in Supabase...", auction_id);
 
     let result = AuctionResult {
         auction_id: auction_id.to_string(),

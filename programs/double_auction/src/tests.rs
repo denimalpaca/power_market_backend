@@ -8,8 +8,8 @@ use crate::{EnergyBid, EnergyOffer, Message};
 fn test_submit_bid() {
     let bid = EnergyBid {
         bidder: "223d54c9-0e14-4399-9cd1-961faea299dc".to_string(),
-        price_per_mwh: 100,
-        quantity_mwh: 50,
+        price_per_mwh: 110,
+        quantity_mwh: 30,
         timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
     };
     
@@ -30,7 +30,7 @@ fn test_submit_bid() {
 fn test_submit_offer() {
     let offer = EnergyOffer {
         seller: "99a4166f-8451-4a6d-a73f-e5ffa1d8bae2".to_string(),
-        price_per_mwh: 90,
+        price_per_mwh: 80,
         quantity_mwh: 30,
         timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
     };
